@@ -471,6 +471,10 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 			a.Stop()
 		}()
 
+		// Reuse the timer rather than allocate one for every paced request.
+		timer := time.NewTimer(time.Hour)
+		timer.Stop()
+		defer timer.Stop()
 		count := uint64(0)
 		for {
 			elapsed := time.Since(atk.began)
@@ -483,7 +487,23 @@ func (a *Attacker) Attack(tr Targeter, p Pacer, du time.Duration, name string) <
 				return
 			}
 
-			time.Sleep(wait)
+			// A sparse schedule must not sleep past the attack window or ignore Stop.
+			// Preserve a request exactly on the boundary, as constant pacing does.
+			end := du > 0 && wait > du-elapsed
+			if end {
+				wait = du - elapsed
+			}
+			if wait > 0 {
+				timer.Reset(wait)
+				select {
+				case <-timer.C:
+				case <-a.stopch:
+					return
+				}
+			}
+			if end {
+				return
+			}
 
 			if workers < a.maxWorkers {
 				select {

@@ -54,6 +54,7 @@ func attackCmd() command {
 	fs.IntVar(&opts.redirects, "redirects", vegeta.DefaultRedirects, "Number of redirects to follow. -1 will not follow but marks as success")
 	fs.Var(&maxBodyFlag{&opts.maxBody}, "max-body", "Maximum number of bytes to capture from response bodies. [-1 = no limit]")
 	fs.Var(&rateFlag{&opts.rate}, "rate", "Number of requests per time unit [0 = infinity]")
+	fs.BoolVar(&opts.exponential, "exponential", false, "Use exponential interarrival times at the mean request rate")
 	fs.Var(&opts.headers, "header", "Request header")
 	fs.Var(&opts.proxyHeaders, "proxy-header", "Proxy CONNECT header")
 	fs.Var(&opts.laddr, "laddr", "Local IP address")
@@ -94,6 +95,7 @@ type attackOpts struct {
 	duration       time.Duration
 	timeout        time.Duration
 	rate           vegeta.Rate
+	exponential    bool
 	workers        uint64
 	maxWorkers     uint64
 	connections    int
@@ -115,6 +117,13 @@ type attackOpts struct {
 // attack validates the attack arguments, sets up the
 // required resources, launches the attack and writes the results
 func attack(opts *attackOpts) (err error) {
+	var pacer vegeta.Pacer = opts.rate
+	if opts.exponential {
+		pacer, err = vegeta.NewExponentialPacer(opts.rate)
+		if err != nil {
+			return err
+		}
+	}
 	if opts.maxWorkers == vegeta.DefaultMaxWorkers && opts.rate.Freq == 0 {
 		return fmt.Errorf("-rate=0 requires setting -max-workers")
 	}
@@ -224,7 +233,7 @@ func attack(opts *attackOpts) (err error) {
 		vegeta.SessionTickets(opts.sessionTickets),
 	)
 
-	res := atk.Attack(tr, opts.rate, opts.duration, opts.name)
+	res := atk.Attack(tr, pacer, opts.duration, opts.name)
 	enc := vegeta.NewEncoder(out)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

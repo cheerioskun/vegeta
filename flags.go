@@ -68,6 +68,7 @@ type rateFlag struct{ *vegeta.Rate }
 
 func (f *rateFlag) Set(v string) (err error) {
 	if v == "infinity" {
+		f.Freq = 0
 		return nil
 	}
 

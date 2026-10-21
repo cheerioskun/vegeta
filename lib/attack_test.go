@@ -562,3 +562,32 @@ func TestAttackConnectTo(t *testing.T) {
 		t.Errorf("unexpected hits (-want +got):\n%s", diff)
 	}
 }
+
+func TestAttackExponentialLongWait(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%v", cancel), func(t *testing.T) {
+			p, _ := NewExponentialPacer(Rate{1, time.Second})
+			entered := make(chan struct{})
+			p.sample = func() float64 { close(entered); return 3600 }
+			attacker := NewAttacker(Workers(1), MaxWorkers(1))
+			duration := 30 * time.Millisecond
+			if cancel {
+				duration = 0
+			}
+			results := attacker.Attack(NewStaticTargeter(Target{Method: "GET", URL: "http://unused.invalid"}), p, duration, "")
+			<-entered
+			if cancel {
+				attacker.Stop()
+			}
+			select {
+			case result, ok := <-results:
+				if ok {
+					t.Fatalf("request issued before a one-hour deadline: %+v", result)
+				}
+			case <-time.After(time.Second):
+				attacker.Stop()
+				t.Fatal("long wait ignored duration/Stop")
+			}
+		})
+	}
+}

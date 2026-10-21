@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -154,5 +156,92 @@ func TestAttackSignalTwice(t *testing.T) {
 	}
 	if got, max := metrics.Duration, time.Second; got > max {
 		t.Errorf("attack duration too long. got %+v, max: %+v", got, max)
+	}
+}
+
+func TestAttackExponentialFlagAndStockResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
+	defer server.Close()
+	dir := t.TempDir()
+	targets, output := filepath.Join(dir, "targets"), filepath.Join(dir, "results.gob")
+	if err := os.WriteFile(targets, []byte("GET "+server.URL+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := attackCmd()
+	if err := cmd.fn([]string{"--exponential", "-rate=5000", "-duration=50ms", "-targets=" + targets, "-output=" + output, "-workers=2", "-max-workers=8", "-timeout=1s", "-dns-ttl=-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := cmd.fs.Lookup("exponential").Value.String(); got != "true" {
+		t.Fatalf("flag=%s", got)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := decodeMetrics(*bytes.NewBuffer(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.Requests == 0 || metrics.Success != 1 {
+		t.Fatalf("requests=%d success=%g", metrics.Requests, metrics.Success)
+	}
+	var text bytes.Buffer
+	if err := vegeta.NewTextReporter(&metrics)(&text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "Requests") {
+		t.Fatal("stock reporter rejected results")
+	}
+	jsonOutput := filepath.Join(dir, "results.json")
+	if err := encode([]string{output}, encodingJSON, jsonOutput); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(jsonOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonMetrics vegeta.Metrics
+	dec := vegeta.DecoderFor(bytes.NewReader(encoded))
+	if dec == nil {
+		t.Fatal("stock JSON encoding not recognized")
+	}
+	for {
+		var result vegeta.Result
+		err = dec.Decode(&result)
+		if err == io.EOF {
+			err = nil
+			break
+		}
+		if err != nil {
+			break
+		}
+		jsonMetrics.Add(&result)
+	}
+	jsonMetrics.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jsonMetrics.Requests != metrics.Requests {
+		t.Fatal("stock JSON conversion lost requests")
+	}
+}
+
+func TestAttackExponentialRejectsUnlimited(t *testing.T) {
+	for _, rate := range []vegeta.Rate{{}, {Freq: -1, Per: time.Second}, {Freq: 1, Per: 0}} {
+		if err := attack(&attackOpts{exponential: true, rate: rate}); err == nil || !strings.Contains(err.Error(), "positive, finite rate") {
+			t.Fatalf("rate%v: %v", rate, err)
+		}
+	}
+	if got := attackCmd().fs.Lookup("exponential").DefValue; got != "false" {
+		t.Fatalf("changed default %s", got)
+	}
+}
+
+func TestAttackExponentialUnlimitedFlags(t *testing.T) {
+	for _, rate := range []string{"0", "infinity"} {
+		cmd := attackCmd()
+		if err := cmd.fn([]string{"--exponential", "-rate=" + rate, "-max-workers=2"}); err == nil || !strings.Contains(err.Error(), "positive, finite rate") {
+			t.Fatalf("rate=%s: %v", rate, err)
+		}
 	}
 }

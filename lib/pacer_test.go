@@ -2,7 +2,9 @@ package vegeta
 
 import (
 	"math"
+	"math/rand"
 	"strconv"
+	"sync"
 	"testing"
 	"testing/quick"
 	"time"
@@ -425,4 +427,92 @@ func TestLinearPacer_Rate(t *testing.T) {
 	if err := quick.Check(prop, &quick.Config{MaxCount: 1e6}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestExponentialPacer(t *testing.T) {
+	for _, rate := range []Rate{{1, time.Second}, {100, 100 * time.Millisecond}, {2, time.Nanosecond}} {
+		p, err := NewExponentialPacer(rate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual, reference := rand.New(rand.NewSource(42)), rand.New(rand.NewSource(42))
+		p.sample = actual.ExpFloat64
+		var deadline float64
+		for hits := uint64(0); hits < 1000; hits++ {
+			deadline += reference.ExpFloat64() * float64(rate.Per) / float64(rate.Freq)
+			elapsed := time.Duration(hits) * time.Millisecond
+			got, stop := p.Pace(elapsed, hits)
+			if want := time.Duration(deadline) - elapsed; stop || got != want {
+				t.Fatalf("rate=%v hits=%d: got (%v,%v), want %v", rate, hits, got, stop, want)
+			}
+		}
+		if got, want := p.Rate(time.Hour), rate.Rate(0); got != want {
+			t.Fatalf("mean rate=%g want%g", got, want)
+		}
+	}
+}
+
+func TestExponentialPacerCatchUpAndRepeatedHit(t *testing.T) {
+	p, _ := NewExponentialPacer(Rate{100, time.Second})
+	calls := 0
+	p.sample = func() float64 { calls++; return 1 }
+	if wait, stop := p.Pace(100*time.Millisecond, 0); stop || wait != -90*time.Millisecond {
+		t.Fatalf("first (%v,%v)", wait, stop)
+	}
+	if wait, stop := p.Pace(150*time.Millisecond, 0); stop || wait != -140*time.Millisecond {
+		t.Fatalf("repeat (%v,%v)", wait, stop)
+	}
+	if wait, stop := p.Pace(200*time.Millisecond, 1); stop || wait != -180*time.Millisecond {
+		t.Fatalf("catch up (%v,%v)", wait, stop)
+	}
+	if calls != 2 {
+		t.Fatalf("sampled %d times, want 2", calls)
+	}
+}
+
+func TestExponentialPacerInvalidAndOverflow(t *testing.T) {
+	for _, rate := range []Rate{{}, {0, time.Second}, {1, 0}, {-1, time.Second}, {1, -time.Second}} {
+		if _, err := NewExponentialPacer(rate); err == nil {
+			t.Errorf("accepted %v", rate)
+		}
+	}
+	for _, sample := range []float64{-1, math.NaN(), math.Inf(1), float64(math.MaxInt64)} {
+		p, _ := NewExponentialPacer(Rate{1, time.Second})
+		p.sample = func() float64 { return sample }
+		if _, stop := p.Pace(0, 0); !stop {
+			t.Errorf("accepted sample%g", sample)
+		}
+	}
+	var zero ExponentialPacer
+	if _, stop := zero.Pace(0, 0); !stop {
+		t.Fatal("zero value must stop")
+	}
+	p, _ := NewExponentialPacer(Rate{1, time.Second})
+	if _, stop := p.Pace(0, 1); !stop {
+		t.Fatal("must start with hit zero")
+	}
+	p.sample = func() float64 { return 0 }
+	if wait, stop := p.Pace(0, 0); stop || wait != 0 {
+		t.Fatal("zero interval must be valid")
+	}
+	if _, stop := p.Pace(0, 2); !stop {
+		t.Fatal("must not skip hits")
+	}
+}
+
+func TestExponentialPacerConcurrentMethods(t *testing.T) {
+	p, _ := NewExponentialPacer(Rate{100, time.Second})
+	p.sample = func() float64 { return 1 }
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, stop := p.Pace(0, 0); stop {
+				t.Error("repeat stopped")
+			}
+			p.Rate(0)
+		}()
+	}
+	wg.Wait()
 }

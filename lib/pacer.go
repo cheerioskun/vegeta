@@ -3,6 +3,8 @@ package vegeta
 import (
 	"fmt"
 	"math"
+	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -82,6 +84,70 @@ func (cp ConstantPacer) Rate(elapsed time.Duration) float64 {
 // fractional hits per nanosecond.
 func (cp ConstantPacer) hitsPerNs() float64 {
 	return float64(cp.Freq) / float64(cp.Per)
+}
+
+// ExponentialPacer schedules independent exponential interarrival times, making
+// Rate the mean arrival rate of a Poisson process. Create one pacer per Attack;
+// its timeline is stateful and must not be reused for another attack. Pace calls
+// must start at hits=0 and advance one hit at a time; repeated hits reuse the same
+// deadline. Methods are safe for concurrent calls, but sharing an instance does
+// not create independent schedules. Deadlines have nanosecond resolution.
+//
+// Worker limits and slow targets can still delay delivery. Like other pacers,
+// this does not change result latency measurements or record unsent arrivals.
+type ExponentialPacer struct {
+	mu          sync.Mutex
+	meanRate    float64
+	interval    float64
+	sample      func() float64
+	deadline    float64
+	hits        uint64
+	initialized bool
+}
+
+// NewExponentialPacer returns a fresh Poisson schedule with the given mean rate.
+// Both the frequency and time unit must be positive; unlimited rates are invalid.
+func NewExponentialPacer(rate Rate) (*ExponentialPacer, error) {
+	if rate.Freq <= 0 || rate.Per <= 0 {
+		return nil, fmt.Errorf("exponential pacing requires a positive, finite rate")
+	}
+	return &ExponentialPacer{
+		meanRate: rate.Rate(0),
+		interval: float64(rate.Per) / float64(rate.Freq),
+		sample:   rand.ExpFloat64,
+	}, nil
+}
+
+var _ Pacer = (*ExponentialPacer)(nil)
+
+// Rate returns the mean rate in requests per second, independent of elapsed time.
+func (p *ExponentialPacer) Rate(_ time.Duration) float64 { return p.meanRate }
+
+// Pace retains the cumulative intended timeline even when the caller falls
+// behind. Fractional nanoseconds accumulate before rounding each deadline.
+// Invalid call sequences or deadlines beyond time.Duration's range stop pacing.
+func (p *ExponentialPacer) Pace(elapsed time.Duration, hits uint64) (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.meanRate <= 0 || elapsed < 0 {
+		return 0, true
+	}
+	switch {
+	case !p.initialized:
+		if hits != 0 {
+			return 0, true
+		}
+	case hits == p.hits:
+		return time.Duration(p.deadline) - elapsed, false
+	case hits < p.hits || hits-p.hits != 1:
+		return 0, true
+	}
+	next := p.deadline + p.sample()*p.interval
+	if next < p.deadline || math.IsNaN(next) || math.IsInf(next, 0) || next >= float64(math.MaxInt64) {
+		return 0, true
+	}
+	p.deadline, p.hits, p.initialized = next, hits, true
+	return time.Duration(next) - elapsed, false
 }
 
 const (

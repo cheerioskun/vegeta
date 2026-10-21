@@ -57,6 +57,17 @@ make vegeta
 mv vegeta ~/bin # Or elsewhere, up to you.
 ```
 
+### Building this fork with exponential pacing
+
+```shell
+git clone https://github.com/cheerioskun/vegeta.git
+cd vegeta
+go build -o vegeta .
+```
+
+Use `./vegeta attack --exponential` with this build. Upstream releases do not
+include this fork's flag; the Go module path remains the upstream library path.
+
 ## Versioning
 
 Both the library and the CLI are versioned with [SemVer v2.0.0](https://semver.org/spec/v2.0.0.html).
@@ -134,6 +145,8 @@ attack command:
     	Prometheus exporter listen address [empty = disabled]. Example: 0.0.0.0:8880
   -proxy-header value
     	Proxy CONNECT header
+  -exponential
+        Use exponential interarrival times at the mean request rate
   -rate value
     	Number of requests per time unit [0 = infinity] (default 50/1s)
   -redirects int
@@ -383,6 +396,31 @@ requests serially (i.e. waiting for a response before sending the next request).
 
 Setting `-max-workers` to a very high number while setting `-rate=0` can result in
 vegeta consuming too many resources and crashing. Use with care.
+
+#### `-exponential`
+
+Use independent exponentially distributed interarrival times (a Poisson arrival
+process) instead of the default evenly spaced schedule. `-rate` specifies the
+mean rate; both the spacing and the number of requests in a fixed duration vary.
+The rate must be positive and finite: `-rate=0` and `-rate=infinity` are rejected
+with this flag. Rate units work as usual, for example `-rate=100/100ms`.
+
+```sh
+echo "GET http://localhost:8080/" | vegeta attack --exponential -rate=1000 -duration=10s | vegeta report
+```
+
+The intended schedule accumulates intervals from the attack's start. Slow
+responses do not reset future deadlines; when behind, the attacker catches up
+as workers become available. Actual delivery can still be constrained by
+`-max-workers`, connections or generator resources. This option does not change
+result formats or latency semantics: reported latency starts when a request is
+issued, excludes earlier scheduling delay, and omits arrivals that never start.
+Stock `report`, `encode` and `plot` commands work unchanged.
+
+Library users can construct a pacer with `NewExponentialPacer(rate)`, check the
+returned error, then pass it to `Attacker.Attack`. Construct
+a fresh pacer for each attack; its cumulative timeline is stateful and must not
+be reused or shared between independent attacks.
 
 #### `-redirects`
 
